@@ -1,7 +1,11 @@
-// Fast drop-in for makefun-site 1.0.0: same output tree, built in one fused pass.
-// Written from the spec (README) plus the reference behaviour; every routine below
-// is my own structure: fused lex+render for Markdown, flat compiled templates
-// rendered into arrays, cached slugs, and index-based front-matter scanning.
+// Fast drop-in for makefun-site 1.0.0: same output tree, built with compiled
+// templates and a range-based Markdown renderer. Written from the spec
+// (README) plus the reference behaviour; every routine below is my own
+// structure: templates are compiled once per case into plain JavaScript
+// functions (no node-tree walk, no per-iteration scope objects), Markdown
+// inline rendering works on index ranges (no substring copies for nesting),
+// word counting rides the line split, and run() returns the case answer
+// already as JSON text so main.ts never re-walks the output tree.
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const RESERVED = ['posts', 'tags', 'page'];
@@ -23,9 +27,15 @@ const HR_RE = /^(?:---|\*\*\*)[ \t]*$/;
 const BULLET_RE = /^[-*] (.*)$/;
 const ORDERED_RE = /^(\d{1,9})\. (.*)$/;
 const CONTINUED_RE = /^ {2,}\S/;
+// ASCII whitespace flags for the branchless word counter (JS \s, ASCII half).
+const WS = new Uint8Array(128);
+WS[9] = 1; WS[10] = 1; WS[11] = 1; WS[12] = 1; WS[13] = 1; WS[32] = 1;
 
 const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const hasOwn = (o, k) => Object.hasOwn(o, k);
+// A scope object with no prototype: plain property reads on it are exactly
+// own-property lookups, which is what the template dialect's lookup does.
+const nullObj = () => Object.create(null);
 
 // ---------------------------------------------------------------- text helpers
 
@@ -57,14 +67,30 @@ function slugRaw(text) {
   if (!ascii) plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
   let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) { gap = out.length > 0; continue; }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
+  if (ascii) {
+    // Char-code loop: a code unit is a letter/digit exactly when its code
+    // point is, and every other unit is a gap, so this matches the
+    // code-point loop of the reference for ASCII text.
+    for (let i = 0; i < plain.length; i++) {
+      const c = plain.charCodeAt(i);
+      let keep = 0;
+      if (c >= 65 && c <= 90) keep = c + 32;
+      else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
+      if (keep === 0) { gap = out.length > 0; continue; }
+      if (gap) out += '-';
+      gap = false;
+      out += String.fromCharCode(keep);
+    }
+  } else {
+    for (const ch of plain) {
+      let keep = null;
+      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+      if (keep === null) { gap = out.length > 0; continue; }
+      if (gap) out += '-';
+      gap = false;
+      out += keep;
+    }
   }
   out = out.slice(0, 64).replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
@@ -92,16 +118,19 @@ function longDate(date) {
   return Number(date.slice(8, 10)) + ' ' + MONTHS[Number(date.slice(5, 7)) - 1] + ' ' + date.slice(0, 4);
 }
 
-function wordCount(text) {
-  let n = 0;
-  let inWord = false;
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    const ws = code < 128 ? code === 32 || (code >= 9 && code <= 13) : /\s/.test(text[i]);
-    if (ws) inWord = false;
-    else if (!inWord) { inWord = true; n++; }
+// Words of a line: branchless over char codes. `p` is 1 when the previous
+// character was whitespace (or at a line start, since '\n' is whitespace),
+// so a word starts exactly where a non-space follows one.
+function countWordsLine(line, words, p) {
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    let w;
+    if (c < 128) w = WS[c];
+    else w = (c === 0xA0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000 || c === 0xFEFF) ? 1 : 0;
+    words += p & (1 - w);
+    p = w;
   }
-  return n;
+  return words;
 }
 
 function resolvePath(dir, rel) {
@@ -172,6 +201,12 @@ function keyVal(key, raw) {
   return { error: 'unknown key "' + key + '"' };
 }
 
+function trimRightWs(s) {
+  let b = s.length;
+  while (b > 0 && (s.charCodeAt(b - 1) === 32 || s.charCodeAt(b - 1) === 9)) b--;
+  return s.slice(0, b);
+}
+
 // Parse front matter by scanning lines in place (no split/join of the body).
 // Returns { data, body } or { error }.
 function parseFM(text) {
@@ -198,7 +233,7 @@ function parseFM(text) {
       if (j === 0 || line[j] !== ':' || (j + 1 < line.length && line[j + 1] !== ' ')) return { error: 'line ' + lineNo + ' is not "key: value"' };
       const key = line.slice(0, j);
       let raw = j + 1 < line.length ? line.slice(j + 2) : '';
-      raw = raw.replace(/[ \t]+$/, '');
+      raw = trimRightWs(raw);
       if (!FM_KEYS.includes(key)) return { error: 'unknown key "' + key + '"' };
       if (hasOwn(data, key)) return { error: 'key "' + key + '" is given twice' };
       if (raw === '') return { error: 'key "' + key + '" has no value' };
@@ -215,45 +250,56 @@ function parseFM(text) {
 
 // ---------------------------------------------------------------- Markdown
 
-function trimLine(line) { return line.replace(/^[ \t]+|[ \t]+$/g, ''); }
+// A line with spaces/tabs at either end dropped (no regex).
+function trimStr(line) {
+  let a = 0;
+  let b = line.length;
+  while (a < b && (line.charCodeAt(a) === 32 || line.charCodeAt(a) === 9)) a++;
+  while (b > a && (line.charCodeAt(b - 1) === 32 || line.charCodeAt(b - 1) === 9)) b--;
+  return line.slice(a, b);
+}
 
 function headingOf(line) {
   const m = HEADING_RE.exec(line);
   return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
 }
 
-function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
+// The first index in [from, to) where `s` holds `what` outside a backslash
+// escape, or -1. The range bound keeps a match from ever reading past `to`.
+function findUnescaped(s, what, from, to) {
+  for (let j = from; j <= to - what.length; j++) {
+    if (s[j] === '\\' && j + 1 < to && ESCAPABLE.has(s[j + 1])) { j++; continue; }
     if (s.startsWith(what, j)) return j;
   }
   return -1;
 }
 
-function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
+function findSingleStar(s, from, to) {
+  for (let j = from; j < to; j++) {
     const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
+    if (c === '\\' && j + 1 < to && ESCAPABLE.has(s[j + 1])) { j++; continue; }
     if (c !== '*') continue;
-    if (s[j + 1] === '*') { j++; continue; }
+    if (j + 1 < to && s[j + 1] === '*') { j++; continue; }
     return j;
   }
   return -1;
 }
 
-// Inline rendering straight into `out` (no intermediate strings for nesting).
-// A fresh native regex finds each special character; plain runs are sliced in
-// bulk. (The regex is created per call so nested renders never share state.)
-function inlineInto(s, link, out) {
-  const re = /[\\`*\[&<>"']/g;
-  let start = 0;
+// Inline rendering of s[lo, hi) straight into `out`. Nested bold, emphasis
+// and link text recurse on index ranges of the same string, so no substring
+// is ever copied for nesting. `re` is one scratch regex per document; its
+// lastIndex is reset explicitly after every recursive call.
+function inlineRange(s, lo, hi, link, out, re) {
+  let start = lo;
+  re.lastIndex = lo;
   let m;
   while ((m = re.exec(s)) !== null) {
     const i = m.index;
+    if (i >= hi) break;
     const c = m[0];
     if (c === '\\') {
       const nx = s[i + 1];
-      if (nx !== undefined && ESCAPABLE.has(nx)) {
+      if (nx !== undefined && i + 1 < hi && ESCAPABLE.has(nx)) {
         if (i > start) out.push(s.slice(start, i));
         out.push(nx === '>' ? '&gt;' : nx);
         re.lastIndex = i + 2;
@@ -263,7 +309,7 @@ function inlineInto(s, link, out) {
     }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
-      if (j > i + 1) {
+      if (j > i + 1 && j < hi) {
         if (i > start) out.push(s.slice(start, i));
         out.push('<code>', esc(s.slice(i + 1, j)), '</code>');
         re.lastIndex = j + 1;
@@ -273,22 +319,22 @@ function inlineInto(s, link, out) {
     }
     if (c === '*') {
       if (s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2);
-        if (j > i + 2) {
+        const j = findUnescaped(s, '**', i + 2, hi);
+        if (j > i + 2 && j + 2 <= hi) {
           if (i > start) out.push(s.slice(start, i));
           out.push('<strong>');
-          inlineInto(s.slice(i + 2, j), link, out);
+          inlineRange(s, i + 2, j, link, out, re);
           out.push('</strong>');
           re.lastIndex = j + 2;
           start = j + 2;
         } else re.lastIndex = i + 2;
         continue;
       }
-      const j = findSingleStar(s, i + 1);
-      if (j > i + 1) {
+      const j = findSingleStar(s, i + 1, hi);
+      if (j > i + 1 && j < hi) {
         if (i > start) out.push(s.slice(start, i));
         out.push('<em>');
-        inlineInto(s.slice(i + 1, j), link, out);
+        inlineRange(s, i + 1, j, link, out, re);
         out.push('</em>');
         re.lastIndex = j + 1;
         start = j + 1;
@@ -296,13 +342,17 @@ function inlineInto(s, link, out) {
       continue;
     }
     if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1);
-      const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const k = findUnescaped(s, ']', i + 1, hi);
+      let mm = -1;
+      if (k !== -1 && k + 1 < hi && s[k + 1] === '(') {
+        const q = s.indexOf(')', k + 2);
+        if (q !== -1 && q < hi) mm = q;
+      }
       const target = mm === -1 ? '' : s.slice(k + 2, mm);
       if (target !== '' && !/\s/.test(target)) {
         if (i > start) out.push(s.slice(start, i));
         out.push('<a href="', esc(link(target)), '">');
-        inlineInto(s.slice(i + 1, k), link, out);
+        inlineRange(s, i + 1, k, link, out, re);
         out.push('</a>');
         re.lastIndex = mm + 1;
         start = mm + 1;
@@ -314,13 +364,7 @@ function inlineInto(s, link, out) {
     re.lastIndex = i + 1;
     start = i + 1;
   }
-  if (start < s.length) out.push(s.slice(start));
-}
-
-function inlineStr(s, link) {
-  const out = [];
-  inlineInto(s, link, out);
-  return out.join('');
+  if (start < hi) out.push(s.slice(start, hi));
 }
 
 // A line that ends a paragraph: blank, fence, heading or thematic break.
@@ -335,21 +379,27 @@ function paraEnds(line) {
   return false;
 }
 
-function listInto(items, isOrd, startNo, link, parts) {
+function listInto(items, isOrd, startNo, link, parts, re) {
   const tag = isOrd ? 'ol' : 'ul';
   parts.push(isOrd && startNo !== 1 ? '<ol start="' + startNo + '">' : '<' + tag + '>', '\n');
   for (const it of items) {
+    const text = it.join('\n');
     parts.push('<li>');
-    inlineInto(it.join('\n'), link, parts);
+    inlineRange(text, 0, text.length, link, parts, re);
     parts.push('</li>\n');
   }
   parts.push('</', tag, '>', '\n');
 }
 
-// Lex + render in one pass over the body's lines, writing straight into `parts`
-// (the document's HTML fragments, joined once by the caller). Returns toc/excerpt.
+// Lex + render in one pass over the body's lines, writing straight into
+// `parts` (the document's HTML fragments, joined once by the caller).
+// Word counting rides the split lines: '\n' is whitespace, so counting each
+// line with a fresh word state is exactly the body's word count.
 function renderMd(body, link, slugCache, parts) {
   const lines = body.split('\n');
+  let words = 0;
+  for (const line of lines) words = countWordsLine(line, words, 1);
+  const re = /[\\`*\[&<>"']/g;
   const toc = [];
   const ids = new Set();
   const next = new Map();
@@ -378,7 +428,9 @@ function renderMd(body, link, slugCache, parts) {
       const h = headingOf(line);
       if (h !== null) {
         const id = uniqSlug(slugify(h.text, slugCache), ids, next);
-        const html = inlineStr(h.text, link);
+        const tmp = [];
+        inlineRange(h.text, 0, h.text.length, link, tmp, re);
+        const html = tmp.join('');
         parts.push('<h' + h.depth + ' id="' + id + '">' + html + '</h' + h.depth + '>', '\n');
         if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
         i++;
@@ -391,22 +443,28 @@ function renderMd(body, link, slugCache, parts) {
         const items = [];
         while (i < nL) {
           const mm = BULLET_RE.exec(lines[i]);
-          if (mm !== null) { items.push([trimLine(mm[1])]); i++; }
-          else if (lines[i].charCodeAt(0) === 32 && CONTINUED_RE.test(lines[i])) { items[items.length - 1].push(trimLine(lines[i])); i++; }
+          if (mm !== null) { items.push([trimStr(mm[1])]); i++; }
+          else if (lines[i].charCodeAt(0) === 32 && CONTINUED_RE.test(lines[i])) { items[items.length - 1].push(trimStr(lines[i])); i++; }
           else break;
         }
-        listInto(items, false, 1, link, parts);
+        listInto(items, false, 1, link, parts, re);
         continue;
       }
     } else if (c0 === 62) {
       const raw = [];
-      while (i < nL && lines[i].startsWith('>')) raw.push(lines[i++].replace(/^> ?/, ''));
+      while (i < nL && lines[i].startsWith('>')) {
+        let l = lines[i++];
+        l = l.slice(1);
+        if (l.charCodeAt(0) === 32) l = l.slice(1);
+        raw.push(l);
+      }
       const kept = [];
-      for (const l of raw) { const t = trimLine(l); if (t !== '') kept.push(t); }
+      for (const l of raw) { const t = trimStr(l); if (t !== '') kept.push(t); }
       if (kept.length === 0) parts.push('<blockquote>\n</blockquote>', '\n');
       else {
+        const text = kept.join('\n');
         parts.push('<blockquote>\n<p>');
-        inlineInto(kept.join('\n'), link, parts);
+        inlineRange(text, 0, text.length, link, parts, re);
         parts.push('</p>\n</blockquote>', '\n');
       }
       continue;
@@ -417,29 +475,31 @@ function renderMd(body, link, slugCache, parts) {
         const startNo = Number(ord[1]);
         while (i < nL) {
           const mm = ORDERED_RE.exec(lines[i]);
-          if (mm !== null) { items.push([trimLine(mm[2])]); i++; }
-          else if (lines[i].charCodeAt(0) === 32 && CONTINUED_RE.test(lines[i])) { items[items.length - 1].push(trimLine(lines[i])); i++; }
+          if (mm !== null) { items.push([trimStr(mm[2])]); i++; }
+          else if (lines[i].charCodeAt(0) === 32 && CONTINUED_RE.test(lines[i])) { items[items.length - 1].push(trimStr(lines[i])); i++; }
           else break;
         }
-        listInto(items, true, startNo, link, parts);
+        listInto(items, true, startNo, link, parts, re);
         continue;
       }
     }
-    const para = [trimLine(line)];
+    const para = [trimStr(line)];
     i++;
-    while (i < nL && !paraEnds(lines[i])) para.push(trimLine(lines[i++]));
+    while (i < nL && !paraEnds(lines[i])) para.push(trimStr(lines[i++]));
     const text = para.join('\n');
     if (excerpt === null) {
-      const html = inlineStr(text, link);
+      const tmp = [];
+      inlineRange(text, 0, text.length, link, tmp, re);
+      const html = tmp.join('');
       excerpt = html;
       parts.push('<p>', html, '</p>', '\n');
     } else {
       parts.push('<p>');
-      inlineInto(text, link, parts);
+      inlineRange(text, 0, text.length, link, parts, re);
       parts.push('</p>', '\n');
     }
   }
-  return { toc, excerpt: excerpt === null ? '' : excerpt };
+  return { toc, excerpt: excerpt === null ? '' : excerpt, words };
 }
 
 // ---------------------------------------------------------------- templates
@@ -525,102 +585,67 @@ function compileTemplate(name, src) {
   return root.b;
 }
 
-function lookup(scope, path) {
-  let s = scope;
-  while (s !== null && !hasOwn(s.v, path[0])) s = s.p;
-  if (s === null) return undefined;
-  let v = s.v[path[0]];
-  for (let k = 1; k < path.length; k++) {
-    if (v === null || typeof v !== 'object' || !hasOwn(v, path[k])) return undefined;
-    v = v[path[k]];
-  }
-  return v;
-}
-
-function textOf(v) {
+// A value as text: a string itself, a number in JavaScript's digits, true
+// or false, an array's items joined by ", ", anything else "".
+function tv(v) {
   if (typeof v === 'string') return v;
-  if (typeof v === 'number') return String(v);
-  if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (Array.isArray(v)) return v.map(textOf).join(', ');
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) return v.map(tv).join(', ');
   return '';
 }
 
-function truthy(v) {
+// Whether a value counts as true in an if: not undefined, null, false, "",
+// 0 or an empty array.
+function tr(v) {
   if (Array.isArray(v)) return v.length > 0;
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-function renderNodes(nodes, scope, cx, depth, out) {
-  for (const n of nodes) {
-    if (n.k === 0) out.push(n.t);
-    else if (n.k === 1) {
-      const s = textOf(lookup(scope, n.p));
-      out.push(n.r ? s : esc(s));
-    } else if (n.k === 3) {
-      const branch = truthy(lookup(scope, n.p)) !== n.nt ? n.a : n.e;
-      if (branch !== null) renderNodes(branch, scope, cx, depth, out);
-    } else if (n.k === 2) {
-      const xs = lookup(scope, n.p);
-      if (!Array.isArray(xs)) continue;
-      for (let k = 0; k < xs.length; k++) {
-        const vars = {};
-        vars[n.n] = xs[k];
-        vars.loop = { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length };
-        renderNodes(n.b, { v: vars, p: scope }, cx, depth, out);
-      }
-    } else if (n.k === 4) {
-      const t = cx.t.get(n.n);
-      if (t !== undefined && depth < 8) {
-        if (cx.g.has(n.n)) {
-          // Case-global template: its output depends only on site/tags/recent
-          // and on the include depth (the depth-8 cut-off), so memoize it.
-          const key = n.n + '\n' + (depth + 1);
-          let s = cx.c.get(key);
-          if (s === undefined) {
-            const tmp = [];
-            renderNodes(t, scope, cx, depth + 1, tmp);
-            s = tmp.join('');
-            cx.c.set(key, s);
-          }
-          out.push(s);
-        } else renderNodes(t, scope, cx, depth + 1, out);
-      }
-    }
+// A path's value as a JavaScript expression over the scope object S and the
+// scratch variable _v. Every scope value is a null-prototype object, an
+// array or a scalar, so a segment read is an own-property read exactly when
+// the value so far is an object; anything else is undefined, as the
+// dialect's lookup says.
+function pathExpr(p) {
+  let e = 'S.' + p[0];
+  for (let k = 1; k < p.length; k++) {
+    e = '(_v=' + e + ',_v==null||typeof _v!=="object"?void 0:_v.' + p[k] + ')';
   }
+  return e;
 }
 
-// Root names a template may read from the scope chain, with `bound` names
-// (loop variables, incl. `loop`) excluded: their values derive from the loop's
-// path, which is itself counted. Includes recurse with the current bound set;
-// a cycle yields a sentinel name, so cyclic templates are never "global".
-function readsOfNodes(nodes, bound, visiting, templates) {
-  const out = new Set();
+// Generate the JavaScript body of one template's node tree. `o` is the
+// output array, `S` the flat scope (loop variables are written into it and
+// restored, so an include sees its caller's loop bindings, as the dialect
+// requires), `D` the include depth, `F` the map of compiled templates.
+function genNodes(nodes) {
+  let s = '';
   for (const n of nodes) {
-    if (n.k === 1) {
-      if (!bound.has(n.p[0])) out.add(n.p[0]);
+    if (n.k === 0) s += 'o.push(' + JSON.stringify(n.t) + ');';
+    else if (n.k === 1) s += n.r ? 'o.push(tv(' + pathExpr(n.p) + '));' : 'o.push(esc(tv(' + pathExpr(n.p) + ')));';
+    else if (n.k === 2) {
+      s += '{const _xs=' + pathExpr(n.p) + ';if(Array.isArray(_xs)){const _sv=S.' + n.n + ',_sl=S.loop,_lp=Object.create(null);_lp.length=_xs.length;for(let _i=0;_i<_xs.length;_i++){_lp.index=_i+1;_lp.first=_i===0;_lp.last=_i===_xs.length-1;S.' + n.n + '=_xs[_i];S.loop=_lp;' + genNodes(n.b) + '}S.' + n.n + '=_sv;S.loop=_sl;}}';
     } else if (n.k === 3) {
-      if (!bound.has(n.p[0])) out.add(n.p[0]);
-      for (const x of readsOfNodes(n.a, bound, visiting, templates)) out.add(x);
-      if (n.e !== null) for (const x of readsOfNodes(n.e, bound, visiting, templates)) out.add(x);
-    } else if (n.k === 2) {
-      if (!bound.has(n.p[0])) out.add(n.p[0]);
-      const b2 = new Set(bound);
-      b2.add(n.n);
-      b2.add('loop');
-      for (const x of readsOfNodes(n.b, b2, visiting, templates)) out.add(x);
+      s += n.nt ? 'if(!tr(' + pathExpr(n.p) + ')){' : 'if(tr(' + pathExpr(n.p) + ')){';
+      s += genNodes(n.a) + '}';
+      if (n.e !== null) s += 'else{' + genNodes(n.e) + '}';
     } else if (n.k === 4) {
-      const sub = templates.get(n.n);
-      if (sub !== undefined) {
-        if (visiting.has(n.n)) out.add('\0cycle');
-        else {
-          visiting.add(n.n);
-          for (const x of readsOfNodes(sub, bound, visiting, templates)) out.add(x);
-          visiting.delete(n.n);
-        }
-      }
+      s += 'if(D<8){const _f=F[' + JSON.stringify(n.n) + '];if(_f)_f(o,S,D+1,F);}';
     }
   }
-  return out;
+  return s;
+}
+
+// Compile every parsed template into a function in one `new Function`
+// call, and return them as a null-prototype map by name.
+function buildTemplates(trees) {
+  let src = '';
+  for (const [name, nodes] of trees) {
+    src += JSON.stringify(name) + ':function(o,S,D,F){var _v;' + genNodes(nodes) + '},';
+  }
+  const factory = new Function('esc', 'tv', 'tr', 'return {' + src + '}');
+  return Object.assign(nullObj(), factory(esc, tv, tr));
 }
 
 // ---------------------------------------------------------------- build
@@ -628,34 +653,40 @@ function readsOfNodes(nodes, bound, visiting, templates) {
 export function run(input) {
   const slugCache = new Map();
   const report = [];
-  const templates = new Map();
+  const trees = new Map();
   for (const name of Object.keys(input.templates).sort()) {
     try {
-      templates.set(name, compileTemplate(name, input.templates[name]));
+      trees.set(name, compileTemplate(name, input.templates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
+  const F = buildTemplates(trees);
   const base = input.site.base_url.replace(/\/+$/, '');
-  // Templates that read only case-global names (site/tags/recent): their
-  // output is the same on every render, so memoize them per (name, depth).
-  const isGlobal = new Set();
-  for (const [name, nodes] of templates) {
-    const r = readsOfNodes(nodes, new Set(), new Set([name]), templates);
-    let g = true;
-    for (const x of r) {
-      if (x !== 'site' && x !== 'tags' && x !== 'recent') { g = false; break; }
-    }
-    if (g) isGlobal.add(name);
-  }
-  const cx = { t: templates, g: isGlobal, c: new Map() };
+  // One flat scope for the whole case: site/tags/recent live on it, and each
+  // render writes its own page/posts/pager/tag keys (all four, every time,
+  // so no render ever sees another's leftovers).
+  const S = nullObj();
+  const outParts = [];
+  const render = (name, setVars) => {
+    const f = F[name];
+    if (f === undefined) return null;
+    S.page = setVars.page;
+    S.posts = setVars.posts;
+    S.pager = setVars.pager;
+    S.tag = setVars.tag;
+    f(outParts, S, 0, F);
+    const s = outParts.join('');
+    outParts.length = 0;
+    return s;
+  };
 
   const files = [...input.files].sort((a, b) => cmp(a.path, b.path));
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n') });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -674,7 +705,7 @@ export function run(input) {
     if (own !== null) { report.push('refused ' + s.path + ': ' + own + '/ is the generator\'s own'); continue; }
     if (s.post && !hasOwn(s.data, 'date')) { report.push('refused ' + s.path + ': a post needs a date'); continue; }
     const layout = s.data.layout !== undefined ? s.data.layout : s.post ? 'post' : 'page';
-    if (!templates.has(layout)) { report.push('refused ' + s.path + ': layout "' + layout + '" is no template that parses'); continue; }
+    if (!trees.has(layout)) { report.push('refused ' + s.path + ': layout "' + layout + '" is no template that parses'); continue; }
     s.layout = layout;
     if (s.data.draft === true) { report.push('draft ' + s.path); continue; }
     kept.push(s);
@@ -727,7 +758,7 @@ export function run(input) {
     s.html = parts.join('');
     s.toc = md.toc;
     s.excerpt = md.excerpt;
-    s.words = wordCount(s.body);
+    s.words = md.words;
   }
 
   // Collections.
@@ -755,7 +786,11 @@ export function run(input) {
       const slug = slugify(name, slugCache);
       let tag = bySlug.get(slug);
       if (tag === undefined) {
-        tag = { name, slug, url: base + '/tags/' + slug + '/', posts: [] };
+        tag = nullObj();
+        tag.name = name;
+        tag.slug = slug;
+        tag.url = base + '/tags/' + slug + '/';
+        tag.posts = [];
         bySlug.set(slug, tag);
       }
       tag.posts.push(p);
@@ -766,7 +801,14 @@ export function run(input) {
     if (s.post) continue;
     s.tagRefs = ownTags(s).map((name) => {
       const slug = slugify(name, slugCache);
-      return bySlug.get(slug) !== undefined ? bySlug.get(slug) : { name, slug, url: '', posts: [] };
+      const t = bySlug.get(slug);
+      if (t !== undefined) return t;
+      const o = nullObj();
+      o.name = name;
+      o.slug = slug;
+      o.url = '';
+      o.posts = [];
+      return o;
     });
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || cmp(x.slug, y.slug));
@@ -774,83 +816,129 @@ export function run(input) {
   // Layouts.
   const cardOf = (s) => {
     if (s._card !== undefined) return s._card;
-    const c = {
-      title: s.data.title,
-      url: s.url,
-      date: s.data.date !== undefined ? s.data.date : '',
-      date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-      summary: s.data.summary !== undefined ? s.data.summary : '',
-      excerpt: s.excerpt,
-      reading_minutes: Math.max(1, Math.ceil(s.words / 200)),
-      tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-    };
+    const c = nullObj();
+    c.title = s.data.title;
+    c.url = s.url;
+    c.date = s.data.date !== undefined ? s.data.date : '';
+    c.date_long = s.data.date === undefined ? '' : longDate(s.data.date);
+    c.summary = s.data.summary !== undefined ? s.data.summary : '';
+    c.excerpt = s.excerpt;
+    c.reading_minutes = Math.max(1, Math.ceil(s.words / 200));
+    c.tags = s.tagRefs.map((t) => {
+      const o = nullObj();
+      o.name = t.name;
+      o.slug = t.slug;
+      o.url = t.url;
+      return o;
+    });
     s._card = c;
     return c;
   };
   const cards = new Map(posts.map((p) => [p, cardOf(p)]));
-  const site = { title: input.site.title, base_url: base };
-  const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
+  const site = nullObj();
+  site.title = input.site.title;
+  site.base_url = base;
+  const allTags = tags.map((t) => {
+    const o = nullObj();
+    o.name = t.name;
+    o.slug = t.slug;
+    o.url = t.url;
+    o.count = t.posts.length;
+    return o;
+  });
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const shared = { site, tags: allTags, recent };
-  const output = {};
-  const render = (name, vars) => {
-    const nodes = templates.get(name);
-    if (nodes === undefined) return null;
-    if (isGlobal.has(name)) {
-      const key = name + '\n0';
-      let s = cx.c.get(key);
-      if (s === undefined) {
-        const out = [];
-        renderNodes(nodes, { v: { ...shared, ...vars }, p: null }, cx, 0, out);
-        s = out.join('');
-        cx.c.set(key, s);
-      }
-      return s;
-    }
-    const out = [];
-    renderNodes(nodes, { v: { ...shared, ...vars }, p: null }, cx, 0, out);
-    return out.join('');
-  };
+  S.site = site;
+  S.tags = allTags;
+  S.recent = recent;
+  const frags = [];
+  const built = new Set();
+  const noVars = { page: undefined, posts: undefined, pager: undefined, tag: undefined };
   for (const s of kept) {
-    const page = {
-      ...cardOf(s),
-      slug: s.slug,
-      content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-      newer: s.newer !== undefined && s.newer !== null ? { title: s.newer.data.title, url: s.newer.url, date: s.newer.data.date !== undefined ? s.newer.data.date : '', date_long: s.newer.data.date === undefined ? '' : longDate(s.newer.data.date) } : null,
-      older: s.older !== undefined && s.older !== null ? { title: s.older.data.title, url: s.older.url, date: s.older.data.date !== undefined ? s.older.data.date : '', date_long: s.older.data.date === undefined ? '' : longDate(s.older.data.date) } : null,
-      is_post: s.post,
-    };
-    // Pages (non-posts) have no newer/older neighbours: newer/older are only
-    // set on posts by the collections step.
-    if (!s.post) { page.newer = null; page.older = null; }
-    output[s.outDir + '/index.html'] = render(s.layout, { page });
+    const card = cardOf(s);
+    const page = nullObj();
+    page.title = card.title;
+    page.url = card.url;
+    page.date = card.date;
+    page.date_long = card.date_long;
+    page.summary = card.summary;
+    page.excerpt = card.excerpt;
+    page.reading_minutes = card.reading_minutes;
+    page.tags = card.tags;
+    page.slug = s.slug;
+    page.content = s.html;
+    page.toc = s.toc.map((h) => {
+      const o = nullObj();
+      o.level = h.level;
+      o.id = h.id;
+      o.html = h.html;
+      return o;
+    });
+    const nw = s.post && s.newer !== null ? s.newer : null;
+    const ol = s.post && s.older !== null ? s.older : null;
+    page.newer = nw === null ? null : (() => {
+      const o = nullObj();
+      o.title = nw.data.title;
+      o.url = nw.url;
+      o.date = nw.data.date !== undefined ? nw.data.date : '';
+      o.date_long = nw.data.date === undefined ? '' : longDate(nw.data.date);
+      return o;
+    })();
+    page.older = ol === null ? null : (() => {
+      const o = nullObj();
+      o.title = ol.data.title;
+      o.url = ol.url;
+      o.date = ol.data.date !== undefined ? ol.data.date : '';
+      o.date_long = ol.data.date === undefined ? '' : longDate(ol.data.date);
+      return o;
+    })();
+    page.is_post = s.post;
+    const html = render(s.layout, { page, posts: undefined, pager: undefined, tag: undefined });
+    built.add(s.outDir + '/index.html');
+    frags.push(JSON.stringify(s.outDir + '/index.html') + ':' + JSON.stringify(html));
   }
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
   const indexUrl = (k) => (k === 1 ? base + '/' : base + '/page/' + k + '/');
   for (let k = 1; k <= pages; k++) {
-    const html = render('index', {
-      posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
-      pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
-    });
-    if (html !== null) output[k === 1 ? 'index.html' : 'page/' + k + '/index.html'] = html;
+    const pager = nullObj();
+    pager.number = k;
+    pager.total = pages;
+    pager.url = indexUrl(k);
+    pager.newer_url = k === 1 ? '' : indexUrl(k - 1);
+    pager.older_url = k === pages ? '' : indexUrl(k + 1);
+    const html = render('index', { page: undefined, posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)), pager, tag: undefined });
+    if (html !== null) {
+      built.add(k === 1 ? 'index.html' : 'page/' + k + '/index.html');
+      frags.push(JSON.stringify(k === 1 ? 'index.html' : 'page/' + k + '/index.html') + ':' + JSON.stringify(html));
+    }
   }
   for (const t of tags) {
-    const html = render('tag', { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
-    if (html !== null) output['tags/' + t.slug + '/index.html'] = html;
+    const tag = nullObj();
+    tag.name = t.name;
+    tag.slug = t.slug;
+    tag.url = t.url;
+    tag.count = t.posts.length;
+    tag.posts = t.posts.map((p) => cards.get(p));
+    const html = render('tag', { page: undefined, posts: undefined, pager: undefined, tag });
+    if (html !== null) {
+      built.add('tags/' + t.slug + '/index.html');
+      frags.push(JSON.stringify('tags/' + t.slug + '/index.html') + ':' + JSON.stringify(html));
+    }
   }
-  const tagsHtml = render('tags', {});
-  if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
+  const tagsHtml = render('tags', noVars);
+  if (tagsHtml !== null) {
+    built.add('tags/index.html');
+    frags.push(JSON.stringify('tags/index.html') + ':' + JSON.stringify(tagsHtml));
+  }
   for (const f of statics) {
-    if (hasOwn(output, f.path)) report.push('shadowed ' + f.path + ': a built page has its path');
-    else output[f.path] = f.content;
+    if (built.has(f.path)) report.push('shadowed ' + f.path + ': a built page has its path');
+    else frags.push(JSON.stringify(f.path) + ':' + JSON.stringify(f.content));
   }
 
   // Report.
   const lines = [...report, ...broken].sort(cmp);
   const pageCount = kept.filter((s) => !s.post).length;
   lines.push('built ' + pageCount + ' pages, ' + posts.length + ' posts, ' + tags.length + ' tags and ' + statics.length + ' static files');
-  output['build-report.txt'] = lines.join('\n') + '\n';
-  return output;
+  frags.push(JSON.stringify('build-report.txt') + ':' + JSON.stringify(lines.join('\n') + '\n'));
+  return '{' + frags.join(',') + '}';
 }
