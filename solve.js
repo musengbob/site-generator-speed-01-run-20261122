@@ -1,11 +1,7 @@
-// Fast drop-in for makefun-site 1.0.0: same output tree, built with compiled
-// templates and a range-based Markdown renderer. Written from the spec
-// (README) plus the reference behaviour; every routine below is my own
-// structure: templates are compiled once per case into plain JavaScript
-// functions (no node-tree walk, no per-iteration scope objects), Markdown
-// inline rendering works on index ranges (no substring copies for nesting),
-// word counting rides the line split, and run() returns the case answer
-// already as JSON text so main.ts never re-walks the output tree.
+// Fast drop-in for makefun-site 1.0.0: same output tree, built in one fused pass.
+// Written from the spec (README) plus the reference behaviour; every routine below
+// is my own structure: fused lex+render for Markdown, flat compiled templates
+// rendered into arrays, cached slugs, and index-based front-matter scanning.
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const RESERVED = ['posts', 'tags', 'page'];
@@ -27,20 +23,22 @@ const HR_RE = /^(?:---|\*\*\*)[ \t]*$/;
 const BULLET_RE = /^[-*] (.*)$/;
 const ORDERED_RE = /^(\d{1,9})\. (.*)$/;
 const CONTINUED_RE = /^ {2,}\S/;
+
 // ASCII whitespace flags for the branchless word counter (JS \s, ASCII half).
 const WS = new Uint8Array(128);
 WS[9] = 1; WS[10] = 1; WS[11] = 1; WS[12] = 1; WS[13] = 1; WS[32] = 1;
 
+
 const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const hasOwn = (o, k) => Object.hasOwn(o, k);
-// A scope object with no prototype: plain property reads on it are exactly
-// own-property lookups, which is what the template dialect's lookup does.
-const nullObj = () => Object.create(null);
 
 // ---------------------------------------------------------------- text helpers
 
+// One native test for "holds no escapable char", instead of five indexOf scans.
+const ESC_TEST = /[&<>"']/;
+
 function esc(s) {
-  if (s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 && s.indexOf('"') === -1 && s.indexOf("'") === -1) return s;
+  if (!ESC_TEST.test(s)) return s;
   let out = '';
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -67,30 +65,14 @@ function slugRaw(text) {
   if (!ascii) plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
   let gap = false;
-  if (ascii) {
-    // Char-code loop: a code unit is a letter/digit exactly when its code
-    // point is, and every other unit is a gap, so this matches the
-    // code-point loop of the reference for ASCII text.
-    for (let i = 0; i < plain.length; i++) {
-      const c = plain.charCodeAt(i);
-      let keep = 0;
-      if (c >= 65 && c <= 90) keep = c + 32;
-      else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
-      if (keep === 0) { gap = out.length > 0; continue; }
-      if (gap) out += '-';
-      gap = false;
-      out += String.fromCharCode(keep);
-    }
-  } else {
-    for (const ch of plain) {
-      let keep = null;
-      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-      if (keep === null) { gap = out.length > 0; continue; }
-      if (gap) out += '-';
-      gap = false;
-      out += keep;
-    }
+  for (const ch of plain) {
+    let keep = null;
+    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
+    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
+    if (keep === null) { gap = out.length > 0; continue; }
+    if (gap) out += '-';
+    gap = false;
+    out += keep;
   }
   out = out.slice(0, 64).replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
@@ -132,6 +114,7 @@ function countWordsLine(line, words, p) {
   }
   return words;
 }
+
 
 function resolvePath(dir, rel) {
   const parts = dir === '' ? [] : dir.split('/');
@@ -201,12 +184,6 @@ function keyVal(key, raw) {
   return { error: 'unknown key "' + key + '"' };
 }
 
-function trimRightWs(s) {
-  let b = s.length;
-  while (b > 0 && (s.charCodeAt(b - 1) === 32 || s.charCodeAt(b - 1) === 9)) b--;
-  return s.slice(0, b);
-}
-
 // Parse front matter by scanning lines in place (no split/join of the body).
 // Returns { data, body } or { error }.
 function parseFM(text) {
@@ -233,7 +210,7 @@ function parseFM(text) {
       if (j === 0 || line[j] !== ':' || (j + 1 < line.length && line[j + 1] !== ' ')) return { error: 'line ' + lineNo + ' is not "key: value"' };
       const key = line.slice(0, j);
       let raw = j + 1 < line.length ? line.slice(j + 2) : '';
-      raw = trimRightWs(raw);
+      raw = raw.replace(/[ \t]+$/, '');
       if (!FM_KEYS.includes(key)) return { error: 'unknown key "' + key + '"' };
       if (hasOwn(data, key)) return { error: 'key "' + key + '" is given twice' };
       if (raw === '') return { error: 'key "' + key + '" has no value' };
@@ -585,67 +562,102 @@ function compileTemplate(name, src) {
   return root.b;
 }
 
-// A value as text: a string itself, a number in JavaScript's digits, true
-// or false, an array's items joined by ", ", anything else "".
-function tv(v) {
+function lookup(scope, path) {
+  let s = scope;
+  while (s !== null && !hasOwn(s.v, path[0])) s = s.p;
+  if (s === null) return undefined;
+  let v = s.v[path[0]];
+  for (let k = 1; k < path.length; k++) {
+    if (v === null || typeof v !== 'object' || !hasOwn(v, path[k])) return undefined;
+    v = v[path[k]];
+  }
+  return v;
+}
+
+function textOf(v) {
   if (typeof v === 'string') return v;
-  if (v === null || v === undefined) return '';
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-  if (Array.isArray(v)) return v.map(tv).join(', ');
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (Array.isArray(v)) return v.map(textOf).join(', ');
   return '';
 }
 
-// Whether a value counts as true in an if: not undefined, null, false, "",
-// 0 or an empty array.
-function tr(v) {
+function truthy(v) {
   if (Array.isArray(v)) return v.length > 0;
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-// A path's value as a JavaScript expression over the scope object S and the
-// scratch variable _v. Every scope value is a null-prototype object, an
-// array or a scalar, so a segment read is an own-property read exactly when
-// the value so far is an object; anything else is undefined, as the
-// dialect's lookup says.
-function pathExpr(p) {
-  let e = 'S.' + p[0];
-  for (let k = 1; k < p.length; k++) {
-    e = '(_v=' + e + ',_v==null||typeof _v!=="object"?void 0:_v.' + p[k] + ')';
-  }
-  return e;
-}
-
-// Generate the JavaScript body of one template's node tree. `o` is the
-// output array, `S` the flat scope (loop variables are written into it and
-// restored, so an include sees its caller's loop bindings, as the dialect
-// requires), `D` the include depth, `F` the map of compiled templates.
-function genNodes(nodes) {
-  let s = '';
+function renderNodes(nodes, scope, cx, depth, out) {
   for (const n of nodes) {
-    if (n.k === 0) s += 'o.push(' + JSON.stringify(n.t) + ');';
-    else if (n.k === 1) s += n.r ? 'o.push(tv(' + pathExpr(n.p) + '));' : 'o.push(esc(tv(' + pathExpr(n.p) + ')));';
-    else if (n.k === 2) {
-      s += '{const _xs=' + pathExpr(n.p) + ';if(Array.isArray(_xs)){const _sv=S.' + n.n + ',_sl=S.loop,_lp=Object.create(null);_lp.length=_xs.length;for(let _i=0;_i<_xs.length;_i++){_lp.index=_i+1;_lp.first=_i===0;_lp.last=_i===_xs.length-1;S.' + n.n + '=_xs[_i];S.loop=_lp;' + genNodes(n.b) + '}S.' + n.n + '=_sv;S.loop=_sl;}}';
+    if (n.k === 0) out.push(n.t);
+    else if (n.k === 1) {
+      const s = textOf(lookup(scope, n.p));
+      out.push(n.r ? s : esc(s));
     } else if (n.k === 3) {
-      s += n.nt ? 'if(!tr(' + pathExpr(n.p) + ')){' : 'if(tr(' + pathExpr(n.p) + ')){';
-      s += genNodes(n.a) + '}';
-      if (n.e !== null) s += 'else{' + genNodes(n.e) + '}';
+      const branch = truthy(lookup(scope, n.p)) !== n.nt ? n.a : n.e;
+      if (branch !== null) renderNodes(branch, scope, cx, depth, out);
+    } else if (n.k === 2) {
+      const xs = lookup(scope, n.p);
+      if (!Array.isArray(xs)) continue;
+      for (let k = 0; k < xs.length; k++) {
+        const vars = {};
+        vars[n.n] = xs[k];
+        vars.loop = { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length };
+        renderNodes(n.b, { v: vars, p: scope }, cx, depth, out);
+      }
     } else if (n.k === 4) {
-      s += 'if(D<8){const _f=F[' + JSON.stringify(n.n) + '];if(_f)_f(o,S,D+1,F);}';
+      const t = cx.t.get(n.n);
+      if (t !== undefined && depth < 8) {
+        if (cx.g.has(n.n)) {
+          // Case-global template: its output depends only on site/tags/recent
+          // and on the include depth (the depth-8 cut-off), so memoize it.
+          const key = n.n + '\n' + (depth + 1);
+          let s = cx.c.get(key);
+          if (s === undefined) {
+            const tmp = [];
+            renderNodes(t, scope, cx, depth + 1, tmp);
+            s = tmp.join('');
+            cx.c.set(key, s);
+          }
+          out.push(s);
+        } else renderNodes(t, scope, cx, depth + 1, out);
+      }
     }
   }
-  return s;
 }
 
-// Compile every parsed template into a function in one `new Function`
-// call, and return them as a null-prototype map by name.
-function buildTemplates(trees) {
-  let src = '';
-  for (const [name, nodes] of trees) {
-    src += JSON.stringify(name) + ':function(o,S,D,F){var _v;' + genNodes(nodes) + '},';
+// Root names a template may read from the scope chain, with `bound` names
+// (loop variables, incl. `loop`) excluded: their values derive from the loop's
+// path, which is itself counted. Includes recurse with the current bound set;
+// a cycle yields a sentinel name, so cyclic templates are never "global".
+function readsOfNodes(nodes, bound, visiting, templates) {
+  const out = new Set();
+  for (const n of nodes) {
+    if (n.k === 1) {
+      if (!bound.has(n.p[0])) out.add(n.p[0]);
+    } else if (n.k === 3) {
+      if (!bound.has(n.p[0])) out.add(n.p[0]);
+      for (const x of readsOfNodes(n.a, bound, visiting, templates)) out.add(x);
+      if (n.e !== null) for (const x of readsOfNodes(n.e, bound, visiting, templates)) out.add(x);
+    } else if (n.k === 2) {
+      if (!bound.has(n.p[0])) out.add(n.p[0]);
+      const b2 = new Set(bound);
+      b2.add(n.n);
+      b2.add('loop');
+      for (const x of readsOfNodes(n.b, b2, visiting, templates)) out.add(x);
+    } else if (n.k === 4) {
+      const sub = templates.get(n.n);
+      if (sub !== undefined) {
+        if (visiting.has(n.n)) out.add('\0cycle');
+        else {
+          visiting.add(n.n);
+          for (const x of readsOfNodes(sub, bound, visiting, templates)) out.add(x);
+          visiting.delete(n.n);
+        }
+      }
+    }
   }
-  const factory = new Function('esc', 'tv', 'tr', 'return {' + src + '}');
-  return Object.assign(nullObj(), factory(esc, tv, tr));
+  return out;
 }
 
 // ---------------------------------------------------------------- build
@@ -653,34 +665,28 @@ function buildTemplates(trees) {
 export function run(input) {
   const slugCache = new Map();
   const report = [];
-  const trees = new Map();
+  const templates = new Map();
   for (const name of Object.keys(input.templates).sort()) {
     try {
-      trees.set(name, compileTemplate(name, input.templates[name]));
+      templates.set(name, compileTemplate(name, input.templates[name]));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
-  const F = buildTemplates(trees);
   const base = input.site.base_url.replace(/\/+$/, '');
-  // One flat scope for the whole case: site/tags/recent live on it, and each
-  // render writes its own page/posts/pager/tag keys (all four, every time,
-  // so no render ever sees another's leftovers).
-  const S = nullObj();
-  const outParts = [];
-  const render = (name, setVars) => {
-    const f = F[name];
-    if (f === undefined) return null;
-    S.page = setVars.page;
-    S.posts = setVars.posts;
-    S.pager = setVars.pager;
-    S.tag = setVars.tag;
-    f(outParts, S, 0, F);
-    const s = outParts.join('');
-    outParts.length = 0;
-    return s;
-  };
+  // Templates that read only case-global names (site/tags/recent): their
+  // output is the same on every render, so memoize them per (name, depth).
+  const isGlobal = new Set();
+  for (const [name, nodes] of templates) {
+    const r = readsOfNodes(nodes, new Set(), new Set([name]), templates);
+    let g = true;
+    for (const x of r) {
+      if (x !== 'site' && x !== 'tags' && x !== 'recent') { g = false; break; }
+    }
+    if (g) isGlobal.add(name);
+  }
+  const cx = { t: templates, g: isGlobal, c: new Map() };
 
   const files = [...input.files].sort((a, b) => cmp(a.path, b.path));
   const sources = [];
@@ -705,7 +711,7 @@ export function run(input) {
     if (own !== null) { report.push('refused ' + s.path + ': ' + own + '/ is the generator\'s own'); continue; }
     if (s.post && !hasOwn(s.data, 'date')) { report.push('refused ' + s.path + ': a post needs a date'); continue; }
     const layout = s.data.layout !== undefined ? s.data.layout : s.post ? 'post' : 'page';
-    if (!trees.has(layout)) { report.push('refused ' + s.path + ': layout "' + layout + '" is no template that parses'); continue; }
+    if (!templates.has(layout)) { report.push('refused ' + s.path + ': layout "' + layout + '" is no template that parses'); continue; }
     s.layout = layout;
     if (s.data.draft === true) { report.push('draft ' + s.path); continue; }
     kept.push(s);
@@ -786,11 +792,7 @@ export function run(input) {
       const slug = slugify(name, slugCache);
       let tag = bySlug.get(slug);
       if (tag === undefined) {
-        tag = nullObj();
-        tag.name = name;
-        tag.slug = slug;
-        tag.url = base + '/tags/' + slug + '/';
-        tag.posts = [];
+        tag = { name, slug, url: base + '/tags/' + slug + '/', posts: [] };
         bySlug.set(slug, tag);
       }
       tag.posts.push(p);
@@ -801,14 +803,7 @@ export function run(input) {
     if (s.post) continue;
     s.tagRefs = ownTags(s).map((name) => {
       const slug = slugify(name, slugCache);
-      const t = bySlug.get(slug);
-      if (t !== undefined) return t;
-      const o = nullObj();
-      o.name = name;
-      o.slug = slug;
-      o.url = '';
-      o.posts = [];
-      return o;
+      return bySlug.get(slug) !== undefined ? bySlug.get(slug) : { name, slug, url: '', posts: [] };
     });
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || cmp(x.slug, y.slug));
@@ -816,129 +811,86 @@ export function run(input) {
   // Layouts.
   const cardOf = (s) => {
     if (s._card !== undefined) return s._card;
-    const c = nullObj();
-    c.title = s.data.title;
-    c.url = s.url;
-    c.date = s.data.date !== undefined ? s.data.date : '';
-    c.date_long = s.data.date === undefined ? '' : longDate(s.data.date);
-    c.summary = s.data.summary !== undefined ? s.data.summary : '';
-    c.excerpt = s.excerpt;
-    c.reading_minutes = Math.max(1, Math.ceil(s.words / 200));
-    c.tags = s.tagRefs.map((t) => {
-      const o = nullObj();
-      o.name = t.name;
-      o.slug = t.slug;
-      o.url = t.url;
-      return o;
-    });
+    const c = {
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date !== undefined ? s.data.date : '',
+      date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+      summary: s.data.summary !== undefined ? s.data.summary : '',
+      excerpt: s.excerpt,
+      reading_minutes: Math.max(1, Math.ceil(s.words / 200)),
+      tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    };
     s._card = c;
     return c;
   };
   const cards = new Map(posts.map((p) => [p, cardOf(p)]));
-  const site = nullObj();
-  site.title = input.site.title;
-  site.base_url = base;
-  const allTags = tags.map((t) => {
-    const o = nullObj();
-    o.name = t.name;
-    o.slug = t.slug;
-    o.url = t.url;
-    o.count = t.posts.length;
-    return o;
-  });
+  const site = { title: input.site.title, base_url: base };
+  const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  S.site = site;
-  S.tags = allTags;
-  S.recent = recent;
-  const frags = [];
-  const built = new Set();
-  const noVars = { page: undefined, posts: undefined, pager: undefined, tag: undefined };
+  const shared = { site, tags: allTags, recent };
+  // One shared scope for the case-global names; each render links its own
+  // vars above it instead of spreading a fresh object per render.
+  const sharedScope = { v: shared, p: null };
+  const output = {};
+  const render = (name, vars) => {
+    const nodes = templates.get(name);
+    if (nodes === undefined) return null;
+    if (isGlobal.has(name)) {
+      const key = name + '\n0';
+      let s = cx.c.get(key);
+      if (s === undefined) {
+        const out = [];
+        renderNodes(nodes, { v: vars, p: sharedScope }, cx, 0, out);
+        s = out.join('');
+        cx.c.set(key, s);
+      }
+      return s;
+    }
+    const out = [];
+    renderNodes(nodes, { v: vars, p: sharedScope }, cx, 0, out);
+    return out.join('');
+  };
   for (const s of kept) {
-    const card = cardOf(s);
-    const page = nullObj();
-    page.title = card.title;
-    page.url = card.url;
-    page.date = card.date;
-    page.date_long = card.date_long;
-    page.summary = card.summary;
-    page.excerpt = card.excerpt;
-    page.reading_minutes = card.reading_minutes;
-    page.tags = card.tags;
-    page.slug = s.slug;
-    page.content = s.html;
-    page.toc = s.toc.map((h) => {
-      const o = nullObj();
-      o.level = h.level;
-      o.id = h.id;
-      o.html = h.html;
-      return o;
-    });
-    const nw = s.post && s.newer !== null ? s.newer : null;
-    const ol = s.post && s.older !== null ? s.older : null;
-    page.newer = nw === null ? null : (() => {
-      const o = nullObj();
-      o.title = nw.data.title;
-      o.url = nw.url;
-      o.date = nw.data.date !== undefined ? nw.data.date : '';
-      o.date_long = nw.data.date === undefined ? '' : longDate(nw.data.date);
-      return o;
-    })();
-    page.older = ol === null ? null : (() => {
-      const o = nullObj();
-      o.title = ol.data.title;
-      o.url = ol.url;
-      o.date = ol.data.date !== undefined ? ol.data.date : '';
-      o.date_long = ol.data.date === undefined ? '' : longDate(ol.data.date);
-      return o;
-    })();
-    page.is_post = s.post;
-    const html = render(s.layout, { page, posts: undefined, pager: undefined, tag: undefined });
-    built.add(s.outDir + '/index.html');
-    frags.push(JSON.stringify(s.outDir + '/index.html') + ':' + JSON.stringify(html));
+    const page = {
+      ...cardOf(s),
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+      newer: s.newer !== undefined && s.newer !== null ? { title: s.newer.data.title, url: s.newer.url, date: s.newer.data.date !== undefined ? s.newer.data.date : '', date_long: s.newer.data.date === undefined ? '' : longDate(s.newer.data.date) } : null,
+      older: s.older !== undefined && s.older !== null ? { title: s.older.data.title, url: s.older.url, date: s.older.data.date !== undefined ? s.older.data.date : '', date_long: s.older.data.date === undefined ? '' : longDate(s.older.data.date) } : null,
+      is_post: s.post,
+    };
+    // Pages (non-posts) have no newer/older neighbours: newer/older are only
+    // set on posts by the collections step.
+    if (!s.post) { page.newer = null; page.older = null; }
+    output[s.outDir + '/index.html'] = render(s.layout, { page });
   }
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
   const indexUrl = (k) => (k === 1 ? base + '/' : base + '/page/' + k + '/');
   for (let k = 1; k <= pages; k++) {
-    const pager = nullObj();
-    pager.number = k;
-    pager.total = pages;
-    pager.url = indexUrl(k);
-    pager.newer_url = k === 1 ? '' : indexUrl(k - 1);
-    pager.older_url = k === pages ? '' : indexUrl(k + 1);
-    const html = render('index', { page: undefined, posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)), pager, tag: undefined });
-    if (html !== null) {
-      built.add(k === 1 ? 'index.html' : 'page/' + k + '/index.html');
-      frags.push(JSON.stringify(k === 1 ? 'index.html' : 'page/' + k + '/index.html') + ':' + JSON.stringify(html));
-    }
+    const html = render('index', {
+      posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
+      pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
+    });
+    if (html !== null) output[k === 1 ? 'index.html' : 'page/' + k + '/index.html'] = html;
   }
   for (const t of tags) {
-    const tag = nullObj();
-    tag.name = t.name;
-    tag.slug = t.slug;
-    tag.url = t.url;
-    tag.count = t.posts.length;
-    tag.posts = t.posts.map((p) => cards.get(p));
-    const html = render('tag', { page: undefined, posts: undefined, pager: undefined, tag });
-    if (html !== null) {
-      built.add('tags/' + t.slug + '/index.html');
-      frags.push(JSON.stringify('tags/' + t.slug + '/index.html') + ':' + JSON.stringify(html));
-    }
+    const html = render('tag', { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
+    if (html !== null) output['tags/' + t.slug + '/index.html'] = html;
   }
-  const tagsHtml = render('tags', noVars);
-  if (tagsHtml !== null) {
-    built.add('tags/index.html');
-    frags.push(JSON.stringify('tags/index.html') + ':' + JSON.stringify(tagsHtml));
-  }
+  const tagsHtml = render('tags', {});
+  if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
   for (const f of statics) {
-    if (built.has(f.path)) report.push('shadowed ' + f.path + ': a built page has its path');
-    else frags.push(JSON.stringify(f.path) + ':' + JSON.stringify(f.content));
+    if (hasOwn(output, f.path)) report.push('shadowed ' + f.path + ': a built page has its path');
+    else output[f.path] = f.content;
   }
 
   // Report.
   const lines = [...report, ...broken].sort(cmp);
   const pageCount = kept.filter((s) => !s.post).length;
   lines.push('built ' + pageCount + ' pages, ' + posts.length + ' posts, ' + tags.length + ' tags and ' + statics.length + ' static files');
-  frags.push(JSON.stringify('build-report.txt') + ':' + JSON.stringify(lines.join('\n') + '\n'));
-  return '{' + frags.join(',') + '}';
+  output['build-report.txt'] = lines.join('\n') + '\n';
+  return output;
 }
